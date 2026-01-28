@@ -1,298 +1,318 @@
 import runpod
-from runpod.serverless.utils import rp_upload
 import os
 import websocket
-import base64
 import json
 import uuid
 import logging
 import urllib.request
 import urllib.parse
-import binascii # Base64 에러 처리를 위해 import
 import subprocess
 import time
+import base64
+import binascii
+import requests
+import glob
+from pathlib import Path
 
-# 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
+server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1")
 client_id = str(uuid.uuid4())
-def save_data_if_base64(data_input, temp_dir, output_filename):
-    """
-    입력 데이터가 Base64 문자열인지 확인하고, 맞다면 파일로 저장 후 경로를 반환합니다.
-    만약 일반 경로 문자열이라면 그대로 반환합니다.
-    """
-    # 입력값이 문자열이 아니면 그대로 반환
-    if not isinstance(data_input, str):
-        return data_input
 
+OUTPUT_DIRS = ["/ComfyUI/output", "/ComfyUI/user/output", "/tmp"]
+
+# -------------------------
+# IO helpers
+# -------------------------
+def download_file_from_url(url: str, output_path: str) -> str:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    result = subprocess.run(
+        ["wget", "-L", "-O", output_path, "--no-verbose", "--timeout=30", "--tries=3", "--retry-connrefused", url],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        logger.info(f"✅ Download OK: {url} -> {output_path} ({os.path.getsize(output_path)} bytes)")
+        return output_path
+    raise Exception(f"URL download failed: {result.stderr}")
+
+def save_base64_to_file(base64_data: str, temp_dir: str, output_filename: str) -> str:
     try:
-        # Base64 문자열은 디코딩을 시도하면 성공합니다.
-        decoded_data = base64.b64decode(data_input)
-        
-        # 디렉토리가 존재하지 않으면 생성
+        decoded = base64.b64decode(base64_data)
         os.makedirs(temp_dir, exist_ok=True)
-        
-        # 디코딩에 성공하면, 임시 파일로 저장합니다.
         file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        with open(file_path, 'wb') as f: # 바이너리 쓰기 모드('wb')로 저장
-            f.write(decoded_data)
-        
-        # 저장된 파일의 경로를 반환합니다.
-        print(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
+        with open(file_path, "wb") as f:
+            f.write(decoded)
+        logger.info(f"✅ Base64 saved: {file_path}")
         return file_path
+    except (binascii.Error, ValueError) as e:
+        raise Exception(f"Base64 decode failed: {e}")
 
-    except (binascii.Error, ValueError):
-        # 디코딩에 실패하면, 일반 경로로 간주하고 원래 값을 그대로 반환합니다.
-        print(f"➡️ '{data_input}'은(는) 파일 경로로 처리합니다.")
-        return data_input
-    
+def process_input(input_data, temp_dir: str, output_filename: str, input_type: str) -> str:
+    if input_type == "path":
+        return input_data
+    if input_type == "url":
+        return download_file_from_url(input_data, os.path.abspath(os.path.join(temp_dir, output_filename)))
+    if input_type == "base64":
+        return save_base64_to_file(input_data, temp_dir, output_filename)
+    raise Exception(f"Unsupported input type: {input_type}")
+
+# -------------------------
+# Comfy helpers
+# -------------------------
+def load_workflow(workflow_path: str):
+    with open(workflow_path, "r") as f:
+        return json.load(f)
+
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
-    logger.info(f"Queueing prompt to: {url}")
-    p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode('utf-8')
+    payload = {"prompt": prompt, "client_id": client_id}
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data)
+    req.add_header("Content-Type", "application/json")
     return json.loads(urllib.request.urlopen(req).read())
 
-def get_image(filename, subfolder, folder_type):
+def get_history(prompt_id: str):
+    url = f"http://{server_address}:8188/history/{prompt_id}"
+    with urllib.request.urlopen(url) as response:
+        return json.loads(response.read())
+
+def view_download(filename: str, subfolder: str, folder_type: str) -> bytes:
     url = f"http://{server_address}:8188/view"
-    logger.info(f"Getting image from: {url}")
-    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
+    data = {"filename": filename, "subfolder": subfolder or "", "type": folder_type or "output"}
     url_values = urllib.parse.urlencode(data)
     with urllib.request.urlopen(f"{url}?{url_values}") as response:
         return response.read()
 
-def get_history(prompt_id):
-    url = f"http://{server_address}:8188/history/{prompt_id}"
-    logger.info(f"Getting history from: {url}")
-    with urllib.request.urlopen(url) as response:
-        return json.loads(response.read())
+def wait_for_comfyui():
+    http_url = f"http://{server_address}:8188/"
+    for i in range(600):
+        try:
+            urllib.request.urlopen(http_url, timeout=5)
+            logger.info(f"✅ ComfyUI ready (attempt {i+1})")
+            return
+        except Exception:
+            time.sleep(1)
+    raise Exception("ComfyUI not reachable via HTTP")
 
-def get_videos(ws, prompt):
-    prompt_id = queue_prompt(prompt)['prompt_id']
-    output_videos = {}
+def find_newest_mp4(prefix: str | None = None) -> str | None:
+    candidates = []
+    for d in OUTPUT_DIRS:
+        candidates += glob.glob(f"{d}/**/*.mp4", recursive=True)
+    candidates = [p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 0]
+    if prefix:
+        candidates = [p for p in candidates if Path(p).name.startswith(prefix)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+def run_and_get_mp4(prompt, filename_prefix: str) -> str:
+    wait_for_comfyui()
+
+    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
+    ws = websocket.WebSocket()
+    ws.connect(ws_url)
+
+    prompt_id = queue_prompt(prompt)["prompt_id"]
+    logger.info(f"▶️ Running workflow prompt_id={prompt_id}")
+
     while True:
         out = ws.recv()
         if isinstance(out, str):
-            message = json.loads(out)
-            if message['type'] == 'executing':
-                data = message['data']
-                if data['node'] is None and data['prompt_id'] == prompt_id:
+            msg = json.loads(out)
+            if msg.get("type") == "executing":
+                data = msg.get("data", {})
+                if data.get("node") is None and data.get("prompt_id") == prompt_id:
                     break
-        else:
-            continue
 
-    history = get_history(prompt_id)[prompt_id]
-    for node_id in history['outputs']:
-        node_output = history['outputs'][node_id]
-        videos_output = []
-        if 'gifs' in node_output:
-            for video in node_output['gifs']:
-                # fullpath를 이용하여 직접 파일을 읽고 base64로 인코딩
-                with open(video['fullpath'], 'rb') as f:
-                    video_data = base64.b64encode(f.read()).decode('utf-8')
-                videos_output.append(video_data)
-        output_videos[node_id] = videos_output
+    ws.close()
 
-    return output_videos
+    history = get_history(prompt_id).get(prompt_id, {})
+    outputs = history.get("outputs", {})
 
-def load_workflow(workflow_path):
-    with open(workflow_path, 'r') as file:
-        return json.load(file)
+    # Read outputs (videos/gifs/images and ui nested)
+    for _, node_output in outputs.items():
+        ui = node_output.get("ui")
+        if isinstance(ui, dict):
+            for k in ("videos", "gifs", "images"):
+                items = ui.get(k)
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            fp = item.get("fullpath")
+                            if fp and os.path.exists(fp) and os.path.getsize(fp) > 0:
+                                return fp
+                            fn = item.get("filename")
+                            if fn:
+                                data = view_download(fn, item.get("subfolder",""), item.get("type","output"))
+                                tmp = f"/tmp/{uuid.uuid4().hex}_{fn}"
+                                with open(tmp, "wb") as f:
+                                    f.write(data)
+                                if os.path.getsize(tmp) > 0:
+                                    if not tmp.lower().endswith(".mp4"):
+                                        tmp2 = tmp + ".mp4"
+                                        os.rename(tmp, tmp2)
+                                        tmp = tmp2
+                                    return tmp
 
+        for k in ("videos", "gifs", "images"):
+            items = node_output.get(k)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        fp = item.get("fullpath")
+                        if fp and os.path.exists(fp) and os.path.getsize(fp) > 0:
+                            return fp
+                        fn = item.get("filename")
+                        if fn:
+                            data = view_download(fn, item.get("subfolder",""), item.get("type","output"))
+                            tmp = f"/tmp/{uuid.uuid4().hex}_{fn}"
+                            with open(tmp, "wb") as f:
+                                f.write(data)
+                            if os.path.getsize(tmp) > 0:
+                                if not tmp.lower().endswith(".mp4"):
+                                    tmp2 = tmp + ".mp4"
+                                    os.rename(tmp, tmp2)
+                                    tmp = tmp2
+                                return tmp
 
-def process_input(input_data, temp_dir, output_filename, input_type):
-    """입력 데이터를 처리하여 파일 경로를 반환하는 함수"""
-    if input_type == "path":
-        # 경로인 경우 그대로 반환
-        logger.info(f"📁 경로 입력 처리: {input_data}")
-        return input_data
-    elif input_type == "url":
-        # URL인 경우 다운로드
-        logger.info(f"🌐 URL 입력 처리: {input_data}")
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        return download_file_from_url(input_data, file_path)
-    elif input_type == "base64":
-        # Base64인 경우 디코딩하여 저장
-        logger.info(f"🔢 Base64 입력 처리")
-        return save_base64_to_file(input_data, temp_dir, output_filename)
-    else:
-        raise Exception(f"지원하지 않는 입력 타입: {input_type}")
+    # Filesystem fallback
+    mp4 = find_newest_mp4(prefix=filename_prefix)
+    if mp4:
+        return mp4
 
-        
-def download_file_from_url(url, output_path):
-    """URL에서 파일을 다운로드하는 함수"""
-    try:
-        # wget을 사용하여 파일 다운로드
-        result = subprocess.run([
-            'wget', '-O', output_path, '--no-verbose', url
-        ], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
-            return output_path
-        else:
-            logger.error(f"❌ wget 다운로드 실패: {result.stderr}")
-            raise Exception(f"URL 다운로드 실패: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logger.error("❌ 다운로드 시간 초과")
-        raise Exception("다운로드 시간 초과")
-    except Exception as e:
-        logger.error(f"❌ 다운로드 중 오류 발생: {e}")
-        raise Exception(f"다운로드 중 오류 발생: {e}")
+    raise Exception("Could not find MP4 output (history empty and no mp4 on disk).")
 
+# -------------------------
+# Supabase upload
+# -------------------------
+def supabase_upload_file(local_path: str, dest_path: str) -> str:
+    supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
+    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    bucket = os.environ.get("SUPABASE_BUCKET", "results")
 
-def save_base64_to_file(base64_data, temp_dir, output_filename):
-    """Base64 데이터를 파일로 저장하는 함수"""
-    try:
-        # Base64 문자열 디코딩
-        decoded_data = base64.b64decode(base64_data)
-        
-        # 디렉토리가 존재하지 않으면 생성
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # 파일로 저장
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        with open(file_path, 'wb') as f:
-            f.write(decoded_data)
-        
-        logger.info(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
-        return file_path
-    except (binascii.Error, ValueError) as e:
-        logger.error(f"❌ Base64 디코딩 실패: {e}")
-        raise Exception(f"Base64 디코딩 실패: {e}")
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{dest_path}"
 
+    with open(local_path, "rb") as f:
+        r = requests.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "apikey": key,
+                "Content-Type": "video/mp4",
+                "x-upsert": "true",
+            },
+            data=f,
+            timeout=300,
+        )
+
+    if not r.ok:
+        raise Exception(f"Supabase upload failed: {r.status_code} {r.text}")
+
+    return f"{supabase_url}/storage/v1/object/public/{bucket}/{dest_path}"
+
+# -------------------------
+# Handler
+# -------------------------
 def handler(job):
     job_input = job.get("input", {})
 
-    logger.info(f"Received job input: {job_input}")
-    task_id = f"task_{uuid.uuid4()}"
+    # Required params (as repo documents)
+    prompt_text = job_input["prompt"]
+    seed = int(job_input["seed"])
+    width = int(job_input["width"])
+    height = int(job_input["height"])
+    fps = int(job_input["fps"])
+    cfg = float(job_input["cfg"])
+    steps = int(job_input.get("steps", 4))
 
+    # Duration cap (seconds): default 8, max 10
+    duration_sec = int(job_input.get("duration_sec", 8))
+    duration_sec = min(max(duration_sec, 1), 10)
+    frame_cap = fps * duration_sec
 
-    image_path = None
-    # 이미지 입력 처리 (image_path, image_url, image_base64 중 하나만 사용)
+    task_id = f"wanimate_{uuid.uuid4().hex}"
+    temp_dir = f"/tmp/{task_id}"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # Image
     if "image_path" in job_input:
-        image_path = process_input(job_input["image_path"], task_id, "input_image.jpg", "path")
+        image_path = process_input(job_input["image_path"], temp_dir, "input_image.jpg", "path")
     elif "image_url" in job_input:
-        image_path = process_input(job_input["image_url"], task_id, "input_image.jpg", "url")
+        image_path = process_input(job_input["image_url"], temp_dir, "input_image.jpg", "url")
     elif "image_base64" in job_input:
-        image_path = process_input(job_input["image_base64"], task_id, "input_image.jpg", "base64")
-
-    video_path = None
-    # 비디오 입력 처리 (video_path, video_url, video_base64 중 하나만 사용)
-    if "video_path" in job_input:
-        video_path = process_input(job_input["video_path"], task_id, "input_video.mp4", "path")
-    elif "video_url" in job_input:
-        video_path = process_input(job_input["video_url"], task_id, "input_video.mp4", "url")
-    elif "video_base64" in job_input:
-        video_path = process_input(job_input["video_base64"], task_id, "input_video.mp4", "base64")
-
-    check_coord = job_input.get("points_store", None)
-
-    # Validate required inputs
-    if image_path is None:
-        raise Exception("Image input is required. Provide image_path, image_url, or image_base64")
-    if video_path is None:
-        raise Exception("Video input is required. Provide video_path, video_url, or video_base64")
-
-    # Initialize prompt variable to avoid UnboundLocalError
-    prompt = None
-
-    if check_coord == None:
-        if job_input.get("mode", "replace") == "animate":
-            prompt = load_workflow('/newWanAnimate_noSAM_animate_api.json')
-        else:
-            prompt = load_workflow('/newWanAnimate_noSAM_api.json')
-
-        prompt["57"]["inputs"]["image"] = image_path
-        prompt["63"]["inputs"]["video"] = video_path
-        prompt["63"]["inputs"]["force_rate"] = job_input["fps"]
-        prompt["30"]["inputs"]["frame_rate"] = job_input["fps"]
-        prompt["65"]["inputs"]["positive_prompt"] = job_input["prompt"]
-        if "negative_prompt" in job_input:
-            prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
-        prompt["27"]["inputs"]["seed"] = job_input["seed"]
-        prompt["27"]["inputs"]["cfg"] = job_input["cfg"]
-        prompt["27"]["inputs"]["steps"] = job_input.get("steps", 4)
-        prompt["150"]["inputs"]["value"] = job_input["width"]
-        prompt["151"]["inputs"]["value"] = job_input["height"]
+        image_path = process_input(job_input["image_base64"], temp_dir, "input_image.jpg", "base64")
     else:
-        if job_input.get("mode", "replace") == "animate":
-            prompt = load_workflow('/newWanAnimate_point_animate_api.json')
-        else:
-            prompt = load_workflow('/newWanAnimate_point_api.json')
-        
-        prompt["57"]["inputs"]["image"] = image_path
-        prompt["63"]["inputs"]["video"] = video_path
-        prompt["63"]["inputs"]["force_rate"] = job_input["fps"]
-        prompt["30"]["inputs"]["frame_rate"] = job_input["fps"]
-        prompt["65"]["inputs"]["positive_prompt"] = job_input["prompt"]
-        if "negative_prompt" in job_input:
-            prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
-        prompt["27"]["inputs"]["seed"] = job_input["seed"]
-        prompt["27"]["inputs"]["cfg"] = job_input["cfg"]
-        prompt["27"]["inputs"]["steps"] = job_input.get("steps", 4)
-        prompt["150"]["inputs"]["value"] = job_input["width"]
-        prompt["151"]["inputs"]["value"] = job_input["height"]
+        raise Exception("Image input required (image_path|image_url|image_base64)")
 
+    # Video
+    if "video_path" in job_input:
+        video_path = process_input(job_input["video_path"], temp_dir, "input_video.mp4", "path")
+    elif "video_url" in job_input:
+        video_path = process_input(job_input["video_url"], temp_dir, "input_video.mp4", "url")
+    elif "video_base64" in job_input:
+        video_path = process_input(job_input["video_base64"], temp_dir, "input_video.mp4", "base64")
+    else:
+        raise Exception("Video input required (video_path|video_url|video_base64)")
+
+    has_points = job_input.get("points_store") is not None
+    mode = job_input.get("mode", "replace")  # replace|animate
+
+    if has_points:
+        workflow_path = "/newWanAnimate_point_animate_api.json" if mode == "animate" else "/newWanAnimate_point_api.json"
+    else:
+        workflow_path = "/newWanAnimate_noSAM_animate_api.json" if mode == "animate" else "/newWanAnimate_noSAM_api.json"
+
+    prompt = load_workflow(workflow_path)
+
+    # Stability overrides
+    # Node 22: avoid sageattn dependency
+    if "22" in prompt and "inputs" in prompt["22"]:
+        prompt["22"]["inputs"]["attention_mode"] = "sdpa"
+
+    # Node 30: ensure output saved + unique prefix
+    if "30" in prompt and "inputs" in prompt["30"]:
+        prompt["30"]["inputs"]["save_output"] = True
+        prompt["30"]["inputs"]["filename_prefix"] = task_id
+
+    # Inject parameters (same ids as your handler already uses)
+    prompt["57"]["inputs"]["image"] = image_path
+    prompt["63"]["inputs"]["video"] = video_path
+    prompt["63"]["inputs"]["force_rate"] = fps
+    prompt["63"]["inputs"]["frame_load_cap"] = frame_cap  # ✅ duration limiter
+    prompt["30"]["inputs"]["frame_rate"] = fps
+
+    prompt["65"]["inputs"]["positive_prompt"] = prompt_text
+    if "negative_prompt" in job_input:
+        prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
+
+    prompt["27"]["inputs"]["seed"] = seed
+    prompt["27"]["inputs"]["cfg"] = cfg
+    prompt["27"]["inputs"]["steps"] = steps
+
+    prompt["150"]["inputs"]["value"] = width
+    prompt["151"]["inputs"]["value"] = height
+
+    if has_points:
         prompt["107"]["inputs"]["points_store"] = job_input["points_store"]
         prompt["107"]["inputs"]["coordinates"] = job_input["coordinates"]
         prompt["107"]["inputs"]["neg_coordinates"] = job_input["neg_coordinates"]
-        # prompt["107"]["inputs"]["width"] = job_input["width"]
-        # prompt["107"]["inputs"]["height"] = job_input["height"]
-    
-    # Validate prompt was assigned
-    if prompt is None:
-        raise RuntimeError("Failed to load workflow. Prompt was not initialized.")
-    
 
-    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
-    logger.info(f"Connecting to WebSocket: {ws_url}")
-    
-    # 먼저 HTTP 연결이 가능한지 확인
-    http_url = f"http://{server_address}:8188/"
-    logger.info(f"Checking HTTP connection to: {http_url}")
-    
-    # HTTP 연결 확인 (최대 1분)
-    max_http_attempts = 180
-    for http_attempt in range(max_http_attempts):
-        try:
-            import urllib.request
-            response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
-            if http_attempt == max_http_attempts - 1:
-                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
-            time.sleep(1)
-    
-    ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
-    for attempt in range(max_attempts):
-        import time
-        try:
-            ws.connect(ws_url)
-            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
-            time.sleep(5)
-    videos = get_videos(ws, prompt)
-    ws.close()
+    # Run and get mp4 path
+    mp4_path = run_and_get_mp4(prompt, filename_prefix=task_id)
 
-    # 이미지가 없는 경우 처리
-    for node_id in videos:
-        if videos[node_id]:
-            return {"video": videos[node_id][0]}
-    
-    return {"error": "비디오를를 찾을 수 없습니다."}
+    # Upload & return URL
+    for k in ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]:
+        if not os.environ.get(k):
+            raise Exception(f"Missing env var: {k}")
+
+    prefix = os.environ.get("SUPABASE_PATH_PREFIX", "wananimate").strip("/")
+    dest_path = f"{prefix}/{task_id}.mp4" if prefix else f"{task_id}.mp4"
+    video_url = supabase_upload_file(mp4_path, dest_path)
+
+    return {"video_url": video_url, "duration_sec": duration_sec, "fps": fps, "frames": frame_cap}
 
 runpod.serverless.start({"handler": handler})
