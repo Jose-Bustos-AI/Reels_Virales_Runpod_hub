@@ -293,8 +293,9 @@ def handler(job):
     prompt["27"]["inputs"]["cfg"] = cfg
     prompt["27"]["inputs"]["steps"] = steps
 
-    if "denoise_strength" in job_input:
+    if "denoise_strength" in job_input and job_input["denoise_strength"] is not None:
     prompt["27"]["inputs"]["denoise"] = float(job_input["denoise_strength"])
+
 
     prompt["150"]["inputs"]["value"] = width
     prompt["151"]["inputs"]["value"] = height
