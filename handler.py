@@ -13,23 +13,15 @@ import binascii
 import requests
 import glob
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, List, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ComfyUI
 server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1")
 client_id = str(uuid.uuid4())
 
-# Output search dirs (fallback)
-OUTPUT_DIRS = [
-    "/ComfyUI/output",
-    "/ComfyUI/user/output",
-    "/comfyui/output",
-    "/comfyui/user/output",
-    "/tmp",
-]
+OUTPUT_DIRS = ["/ComfyUI/output", "/ComfyUI/user/output", "/tmp"]
 
 # -------------------------
 # IO helpers
@@ -86,11 +78,11 @@ def process_input(input_data, temp_dir: str, output_filename: str, input_type: s
 # -------------------------
 # Comfy helpers
 # -------------------------
-def load_workflow(workflow_path: str) -> Dict[str, Any]:
-    with open(workflow_path, "r", encoding="utf-8") as f:
+def load_workflow(workflow_path: str):
+    with open(workflow_path, "r") as f:
         return json.load(f)
 
-def queue_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
+def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
     payload = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(payload).encode("utf-8")
@@ -98,7 +90,7 @@ def queue_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
     req.add_header("Content-Type", "application/json")
     return json.loads(urllib.request.urlopen(req).read())
 
-def get_history(prompt_id: str) -> Dict[str, Any]:
+def get_history(prompt_id: str):
     url = f"http://{server_address}:8188/history/{prompt_id}"
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
@@ -110,7 +102,7 @@ def view_download(filename: str, subfolder: str, folder_type: str) -> bytes:
     with urllib.request.urlopen(f"{url}?{url_values}") as response:
         return response.read()
 
-def wait_for_comfyui() -> None:
+def wait_for_comfyui():
     http_url = f"http://{server_address}:8188/"
     for i in range(600):
         try:
@@ -133,7 +125,7 @@ def find_newest_mp4(prefix: Optional[str] = None) -> Optional[str]:
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
 
-def run_and_get_mp4(prompt: Dict[str, Any], filename_prefix: str) -> str:
+def run_and_get_mp4(prompt, filename_prefix: str) -> str:
     wait_for_comfyui()
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
@@ -143,7 +135,6 @@ def run_and_get_mp4(prompt: Dict[str, Any], filename_prefix: str) -> str:
     prompt_id = queue_prompt(prompt)["prompt_id"]
     logger.info(f"▶️ Running workflow prompt_id={prompt_id}")
 
-    # Wait for finished
     while True:
         out = ws.recv()
         if isinstance(out, str):
@@ -158,45 +149,51 @@ def run_and_get_mp4(prompt: Dict[str, Any], filename_prefix: str) -> str:
     history = get_history(prompt_id).get(prompt_id, {})
     outputs = history.get("outputs", {})
 
-    # Try outputs (ui nested or direct)
-    def try_items(items: Any) -> Optional[str]:
-        if not isinstance(items, list):
-            return None
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            fp = item.get("fullpath")
-            if fp and os.path.exists(fp) and os.path.getsize(fp) > 0:
-                return fp
-            fn = item.get("filename")
-            if fn:
-                data = view_download(fn, item.get("subfolder", ""), item.get("type", "output"))
-                tmp = f"/tmp/{uuid.uuid4().hex}_{fn}"
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                if os.path.getsize(tmp) > 0:
-                    if not tmp.lower().endswith(".mp4"):
-                        tmp2 = tmp + ".mp4"
-                        os.rename(tmp, tmp2)
-                        tmp = tmp2
-                    return tmp
-        return None
-
+    # Read outputs (videos/gifs/images and ui nested)
     for _, node_output in outputs.items():
-        if not isinstance(node_output, dict):
-            continue
-
         ui = node_output.get("ui")
         if isinstance(ui, dict):
             for k in ("videos", "gifs", "images"):
-                got = try_items(ui.get(k))
-                if got:
-                    return got
+                items = ui.get(k)
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            fp = item.get("fullpath")
+                            if fp and os.path.exists(fp) and os.path.getsize(fp) > 0:
+                                return fp
+                            fn = item.get("filename")
+                            if fn:
+                                data = view_download(fn, item.get("subfolder", ""), item.get("type", "output"))
+                                tmp = f"/tmp/{uuid.uuid4().hex}_{fn}"
+                                with open(tmp, "wb") as f:
+                                    f.write(data)
+                                if os.path.getsize(tmp) > 0:
+                                    if not tmp.lower().endswith(".mp4"):
+                                        tmp2 = tmp + ".mp4"
+                                        os.rename(tmp, tmp2)
+                                        tmp = tmp2
+                                    return tmp
 
         for k in ("videos", "gifs", "images"):
-            got = try_items(node_output.get(k))
-            if got:
-                return got
+            items = node_output.get(k)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        fp = item.get("fullpath")
+                        if fp and os.path.exists(fp) and os.path.getsize(fp) > 0:
+                            return fp
+                        fn = item.get("filename")
+                        if fn:
+                            data = view_download(fn, item.get("subfolder", ""), item.get("type", "output"))
+                            tmp = f"/tmp/{uuid.uuid4().hex}_{fn}"
+                            with open(tmp, "wb") as f:
+                                f.write(data)
+                            if os.path.getsize(tmp) > 0:
+                                if not tmp.lower().endswith(".mp4"):
+                                    tmp2 = tmp + ".mp4"
+                                    os.rename(tmp, tmp2)
+                                    tmp = tmp2
+                                return tmp
 
     # Filesystem fallback
     mp4 = find_newest_mp4(prefix=filename_prefix)
@@ -216,7 +213,7 @@ def supabase_upload_file(local_path: str, dest_path: str) -> str:
     upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{dest_path}"
 
     with open(local_path, "rb") as f:
-        r = requests.put(
+        r = requests.post(
             upload_url,
             headers={
                 "Authorization": f"Bearer {key}",
@@ -224,7 +221,6 @@ def supabase_upload_file(local_path: str, dest_path: str) -> str:
                 "Content-Type": "video/mp4",
                 "x-upsert": "true",
             },
-            params={"upsert": "true"},
             data=f,
             timeout=300,
         )
@@ -235,53 +231,49 @@ def supabase_upload_file(local_path: str, dest_path: str) -> str:
     return f"{supabase_url}/storage/v1/object/public/{bucket}/{dest_path}"
 
 # -------------------------
-# Denoise injection (supports BOTH: WanAnimate node 27 AND I2V_WAN22 nodes 139/140)
+# Denoise injection (FIXED & ROBUST)
 # -------------------------
 def apply_denoise_strength(prompt: Dict[str, Any], job_input: Dict[str, Any]) -> None:
     if "denoise_strength" not in job_input or job_input["denoise_strength"] is None:
         return
 
-    val = float(job_input["denoise_strength"])
-    applied = False
+    try:
+        val = float(job_input["denoise_strength"])
+    except Exception:
+        raise Exception("denoise_strength must be a number")
 
-    # I2V_WAN22.json explicit nodes
-    if "139" in prompt and isinstance(prompt["139"], dict):
-        prompt["139"].setdefault("inputs", {})["denoise_strength"] = val
-        applied = True
-        logger.info(f"✅ denoise_strength applied to node 139 -> {val}")
+    applied_nodes: List[str] = []
 
-    if "140" in prompt and isinstance(prompt["140"], dict):
-        prompt["140"].setdefault("inputs", {})["denoise_strength"] = val
-        applied = True
-        logger.info(f"✅ denoise_strength applied to node 140 -> {val}")
+    # Prefer explicit known nodes (I2V_WAN22 style)
+    for nid in ("139", "140"):
+        if nid in prompt and isinstance(prompt[nid], dict):
+            prompt[nid].setdefault("inputs", {})["denoise_strength"] = val
+            applied_nodes.append(nid)
 
-    # WanAnimate often uses node 27 WanVideoSampler
-    if not applied and "27" in prompt and isinstance(prompt["27"], dict):
-        inputs = prompt["27"].setdefault("inputs", {})
-        if "denoise_strength" in inputs:
-            inputs["denoise_strength"] = val
-            applied = True
-            logger.info(f"✅ denoise_strength applied to node 27 -> {val}")
+    # Also handle common WanAnimate node
+    if "27" in prompt and isinstance(prompt["27"], dict):
+        prompt["27"].setdefault("inputs", {})["denoise_strength"] = val
+        applied_nodes.append("27")
 
-    # Fallback: any WanVideoSampler
-    if not applied:
-        for nid, node in prompt.items():
-            if isinstance(node, dict) and node.get("class_type") == "WanVideoSampler":
-                node.setdefault("inputs", {})["denoise_strength"] = val
-                applied = True
-                logger.info(f"✅ denoise_strength applied to WanVideoSampler node {nid} -> {val}")
+    # Ultimate fallback: apply to all WanVideoSampler nodes
+    for nid, node in prompt.items():
+        if isinstance(node, dict) and node.get("class_type") == "WanVideoSampler":
+            node.setdefault("inputs", {})["denoise_strength"] = val
+            if nid not in applied_nodes:
+                applied_nodes.append(str(nid))
 
-    if not applied:
-        logger.warning("⚠️ denoise_strength provided but no WanVideoSampler nodes found in workflow.")
+    if applied_nodes:
+        logger.info(f"✅ denoise_strength applied to WanVideoSampler nodes {applied_nodes} -> {val}")
+    else:
+        logger.warning(f"⚠️ denoise_strength provided but no WanVideoSampler nodes found. val={val}")
 
 # -------------------------
 # Handler
 # -------------------------
 def handler(job):
-    job_input = job.get("input", {}) or {}
+    job_input = job.get("input", {})
 
-    # Required params
-    # (do NOT invent defaults here unless you already used them before)
+    # Required params (as repo documents)
     prompt_text = job_input["prompt"]
     seed = int(job_input["seed"])
     width = int(job_input["width"])
@@ -299,7 +291,7 @@ def handler(job):
     temp_dir = f"/tmp/{task_id}"
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Image input
+    # Image
     if "image_path" in job_input:
         image_path = process_input(job_input["image_path"], temp_dir, "input_image.jpg", "path")
     elif "image_url" in job_input:
@@ -309,7 +301,7 @@ def handler(job):
     else:
         raise Exception("Image input required (image_path|image_url|image_base64)")
 
-    # Video input
+    # Video
     if "video_path" in job_input:
         video_path = process_input(job_input["video_path"], temp_dir, "input_video.mp4", "path")
     elif "video_url" in job_input:
@@ -322,7 +314,6 @@ def handler(job):
     has_points = job_input.get("points_store") is not None
     mode = job_input.get("mode", "replace")  # replace|animate
 
-    # Pick workflow (same as your previous working setup)
     if has_points:
         workflow_path = "/newWanAnimate_point_animate_api.json" if mode == "animate" else "/newWanAnimate_point_api.json"
     else:
@@ -331,66 +322,40 @@ def handler(job):
     prompt = load_workflow(workflow_path)
 
     # Stability overrides
-    # Node 22: avoid sageattn dependency (SM90 issues)
-    if "22" in prompt and isinstance(prompt["22"], dict):
-        inputs = prompt["22"].setdefault("inputs", {})
-        if "attention_mode" in inputs:
-            inputs["attention_mode"] = "sdpa"
+    # Node 22: avoid sageattn dependency (keeps your current stability)
+    if "22" in prompt and "inputs" in prompt["22"]:
+        prompt["22"]["inputs"]["attention_mode"] = "sdpa"
 
     # Node 30: ensure output saved + unique prefix
-    if "30" in prompt and isinstance(prompt["30"], dict):
-        inputs = prompt["30"].setdefault("inputs", {})
-        if "save_output" in inputs:
-            inputs["save_output"] = True
-        if "filename_prefix" in inputs:
-            inputs["filename_prefix"] = task_id
-        if "frame_rate" in inputs:
-            inputs["frame_rate"] = fps
+    if "30" in prompt and "inputs" in prompt["30"]:
+        prompt["30"]["inputs"]["save_output"] = True
+        prompt["30"]["inputs"]["filename_prefix"] = task_id
 
-    # Inject parameters (IDs you already use)
-    # 57 image, 63 video
-    if "57" in prompt:
-        prompt["57"].setdefault("inputs", {})["image"] = image_path
-    if "63" in prompt:
-        vinputs = prompt["63"].setdefault("inputs", {})
-        vinputs["video"] = video_path
-        vinputs["force_rate"] = fps
-        vinputs["frame_load_cap"] = frame_cap  # ✅ duration limiter
+    # Inject parameters (same ids as your handler already uses)
+    prompt["57"]["inputs"]["image"] = image_path
+    prompt["63"]["inputs"]["video"] = video_path
+    prompt["63"]["inputs"]["force_rate"] = fps
+    prompt["63"]["inputs"]["frame_load_cap"] = frame_cap  # ✅ duration limiter
+    prompt["30"]["inputs"]["frame_rate"] = fps
 
-    # Prompts
-    if "65" in prompt:
-        pinputs = prompt["65"].setdefault("inputs", {})
-        if "positive_prompt" in pinputs:
-            pinputs["positive_prompt"] = prompt_text
-        # only set if provided
-        if "negative_prompt" in job_input and job_input["negative_prompt"] is not None:
-            if "negative_prompt" in pinputs:
-                pinputs["negative_prompt"] = job_input["negative_prompt"]
+    prompt["65"]["inputs"]["positive_prompt"] = prompt_text
+    if "negative_prompt" in job_input:
+        prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
 
-    # Sampler base params (commonly node 27 in WanAnimate)
-    if "27" in prompt:
-        sinputs = prompt["27"].setdefault("inputs", {})
-        if "seed" in sinputs:
-            sinputs["seed"] = seed
-        if "cfg" in sinputs:
-            sinputs["cfg"] = cfg
-        if "steps" in sinputs:
-            sinputs["steps"] = steps
+    prompt["27"]["inputs"]["seed"] = seed
+    prompt["27"]["inputs"]["cfg"] = cfg
+    prompt["27"]["inputs"]["steps"] = steps
 
-    # ✅ DENOISE (fixed, robust, correct)
+    # ✅ FIX REAL: denoise_strength injection (robust + no indent errors)
     apply_denoise_strength(prompt, job_input)
 
-    # Resolution constants
-    if "150" in prompt:
-        prompt["150"].setdefault("inputs", {})["value"] = width
-    if "151" in prompt:
-        prompt["151"].setdefault("inputs", {})["value"] = height
+    prompt["150"]["inputs"]["value"] = width
+    prompt["151"]["inputs"]["value"] = height
 
-    # Points mode
     if has_points:
-        prompt["107"].setdefault("inputs", {})["points_store"] = job_input["points_store"]
-        prompt["107"].setdefault("inputs", {})["coordinates"] = job_input["coordinates"]
-        prompt["107"].setdefault("inputs", {})["neg_coordinates"] = job_input["neg_coordinates"]
+        prompt["107"]["inputs"]["points_store"] = job_input["points_store"]
+        prompt["107"]["inputs"]["coordinates"] = job_input["coordinates"]
+        prompt["107"]["inputs"]["neg_coordinates"] = job_input["neg_coordinates"]
 
     # Run and get mp4 path
     mp4_path = run_and_get_mp4(prompt, filename_prefix=task_id)
@@ -404,16 +369,6 @@ def handler(job):
     dest_path = f"{prefix}/{task_id}.mp4" if prefix else f"{task_id}.mp4"
     video_url = supabase_upload_file(mp4_path, dest_path)
 
-    return {
-        "video_url": video_url,
-        "duration_sec": duration_sec,
-        "fps": fps,
-        "frames": frame_cap,
-        "seed": seed,
-        "cfg": cfg,
-        "steps": steps,
-        "denoise_strength": job_input.get("denoise_strength", None),
-        "workflow_path": workflow_path,
-    }
+    return {"video_url": video_url, "duration_sec": duration_sec, "fps": fps, "frames": frame_cap}
 
 runpod.serverless.start({"handler": handler})
