@@ -13,7 +13,7 @@ import binascii
 import requests
 import glob
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,12 +39,14 @@ def download_file_from_url(url: str, output_path: str) -> str:
         return output_path
     raise Exception(f"URL download failed: {result.stderr}")
 
+
 def save_base64_to_file(base64_data: str, temp_dir: str, output_filename: str) -> str:
     try:
         if not isinstance(base64_data, str):
             raise Exception("base64_data is not a string")
 
         b64 = base64_data.strip()
+        # supports data-uri
         if "base64," in b64:
             b64 = b64.split("base64,", 1)[1].strip()
 
@@ -53,6 +55,7 @@ def save_base64_to_file(base64_data: str, temp_dir: str, output_filename: str) -
             b64 += "=" * missing
 
         decoded = base64.b64decode(b64, validate=False)
+
         os.makedirs(temp_dir, exist_ok=True)
         file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
         with open(file_path, "wb") as f:
@@ -66,6 +69,7 @@ def save_base64_to_file(base64_data: str, temp_dir: str, output_filename: str) -
     except (binascii.Error, ValueError) as e:
         raise Exception(f"Base64 decode failed: {e}")
 
+
 def process_input(input_data, temp_dir: str, output_filename: str, input_type: str) -> str:
     if input_type == "path":
         return input_data
@@ -75,14 +79,16 @@ def process_input(input_data, temp_dir: str, output_filename: str, input_type: s
         return save_base64_to_file(input_data, temp_dir, output_filename)
     raise Exception(f"Unsupported input type: {input_type}")
 
+
 # -------------------------
 # Comfy helpers
 # -------------------------
-def load_workflow(workflow_path: str):
-    with open(workflow_path, "r") as f:
+def load_workflow(workflow_path: str) -> Dict[str, Any]:
+    with open(workflow_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def queue_prompt(prompt):
+
+def queue_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
     url = f"http://{server_address}:8188/prompt"
     payload = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(payload).encode("utf-8")
@@ -90,10 +96,12 @@ def queue_prompt(prompt):
     req.add_header("Content-Type", "application/json")
     return json.loads(urllib.request.urlopen(req).read())
 
-def get_history(prompt_id: str):
+
+def get_history(prompt_id: str) -> Dict[str, Any]:
     url = f"http://{server_address}:8188/history/{prompt_id}"
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
+
 
 def view_download(filename: str, subfolder: str, folder_type: str) -> bytes:
     url = f"http://{server_address}:8188/view"
@@ -101,6 +109,7 @@ def view_download(filename: str, subfolder: str, folder_type: str) -> bytes:
     url_values = urllib.parse.urlencode(data)
     with urllib.request.urlopen(f"{url}?{url_values}") as response:
         return response.read()
+
 
 def wait_for_comfyui():
     http_url = f"http://{server_address}:8188/"
@@ -112,6 +121,7 @@ def wait_for_comfyui():
         except Exception:
             time.sleep(1)
     raise Exception("ComfyUI not reachable via HTTP")
+
 
 def find_newest_mp4(prefix: Optional[str] = None) -> Optional[str]:
     candidates: List[str] = []
@@ -125,7 +135,8 @@ def find_newest_mp4(prefix: Optional[str] = None) -> Optional[str]:
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
 
-def run_and_get_mp4(prompt, filename_prefix: str) -> str:
+
+def run_and_get_mp4(prompt: Dict[str, Any], filename_prefix: str) -> str:
     wait_for_comfyui()
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
@@ -135,6 +146,7 @@ def run_and_get_mp4(prompt, filename_prefix: str) -> str:
     prompt_id = queue_prompt(prompt)["prompt_id"]
     logger.info(f"▶️ Running workflow prompt_id={prompt_id}")
 
+    # wait until finished
     while True:
         out = ws.recv()
         if isinstance(out, str):
@@ -202,6 +214,7 @@ def run_and_get_mp4(prompt, filename_prefix: str) -> str:
 
     raise Exception("Could not find MP4 output (history empty and no mp4 on disk).")
 
+
 # -------------------------
 # Supabase upload
 # -------------------------
@@ -230,9 +243,33 @@ def supabase_upload_file(local_path: str, dest_path: str) -> str:
 
     return f"{supabase_url}/storage/v1/object/public/{bucket}/{dest_path}"
 
+
 # -------------------------
-# Denoise injection (FIXED & ROBUST)
+# Param injection helpers
 # -------------------------
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def force_sdpa(prompt: Dict[str, Any]) -> None:
+    # deterministic ID if present
+    if "22" in prompt and isinstance(prompt["22"], dict):
+        inputs = prompt["22"].setdefault("inputs", {})
+        if "attention_mode" in inputs and inputs.get("attention_mode") != "sdpa":
+            old = inputs.get("attention_mode")
+            inputs["attention_mode"] = "sdpa"
+            logger.info(f"✅ attention_mode forced sdpa on node 22 (was {old})")
+
+    # fallback by class_type
+    for nid, node in prompt.items():
+        if isinstance(node, dict) and node.get("class_type") == "WanVideoModelLoader":
+            inputs = node.setdefault("inputs", {})
+            if inputs.get("attention_mode") != "sdpa":
+                old = inputs.get("attention_mode", "auto")
+                inputs["attention_mode"] = "sdpa"
+                logger.info(f"✅ attention_mode forced sdpa on WanVideoModelLoader node {nid} (was {old})")
+
+
 def apply_denoise_strength(prompt: Dict[str, Any], job_input: Dict[str, Any]) -> None:
     if "denoise_strength" not in job_input or job_input["denoise_strength"] is None:
         return
@@ -240,40 +277,79 @@ def apply_denoise_strength(prompt: Dict[str, Any], job_input: Dict[str, Any]) ->
     try:
         val = float(job_input["denoise_strength"])
     except Exception:
-        raise Exception("denoise_strength must be a number")
+        raise Exception("denoise_strength must be numeric")
 
-    applied_nodes: List[str] = []
+    # rango sano (evita corrupción por valores extremos)
+    val = clamp(val, 0.05, 1.0)
 
-    # Prefer explicit known nodes (I2V_WAN22 style)
+    applied = False
+
+    # If explicit nodes exist (I2V_WAN22 case)
     for nid in ("139", "140"):
         if nid in prompt and isinstance(prompt[nid], dict):
             prompt[nid].setdefault("inputs", {})["denoise_strength"] = val
-            applied_nodes.append(nid)
+            logger.info(f"✅ denoise_strength applied to node {nid} -> {val}")
+            applied = True
 
-    # Also handle common WanAnimate node
-    if "27" in prompt and isinstance(prompt["27"], dict):
+    # If WanAnimate uses node 27
+    if not applied and "27" in prompt and isinstance(prompt["27"], dict):
         prompt["27"].setdefault("inputs", {})["denoise_strength"] = val
-        applied_nodes.append("27")
+        logger.info(f"✅ denoise_strength applied to node 27 -> {val}")
+        applied = True
 
-    # Ultimate fallback: apply to all WanVideoSampler nodes
+    # Generic: apply to every WanVideoSampler node
     for nid, node in prompt.items():
         if isinstance(node, dict) and node.get("class_type") == "WanVideoSampler":
             node.setdefault("inputs", {})["denoise_strength"] = val
-            if nid not in applied_nodes:
-                applied_nodes.append(str(nid))
+            logger.info(f"✅ denoise_strength applied to WanVideoSampler node {nid} -> {val}")
+            applied = True
 
-    if applied_nodes:
-        logger.info(f"✅ denoise_strength applied to WanVideoSampler nodes {applied_nodes} -> {val}")
-    else:
-        logger.warning(f"⚠️ denoise_strength provided but no WanVideoSampler nodes found. val={val}")
+    if not applied:
+        logger.warning("⚠️ denoise_strength provided but no WanVideoSampler nodes found; ignored")
+
+
+def apply_face_pose_strength(prompt: Dict[str, Any], job_input: Dict[str, Any]) -> None:
+    # Node 198 in your workflow: AdaptiveWanVideoAnimateEmbeds
+    if "198" not in prompt or not isinstance(prompt["198"], dict):
+        # do not crash; just warn
+        if ("face_strength" in job_input and job_input["face_strength"] is not None) or (
+            "pose_strength" in job_input and job_input["pose_strength"] is not None
+        ):
+            logger.warning("⚠️ Node 198 not found; face_strength/pose_strength ignored")
+        return
+
+    inputs = prompt["198"].setdefault("inputs", {})
+
+    if "face_strength" in job_input and job_input["face_strength"] is not None:
+        try:
+            val = float(job_input["face_strength"])
+        except Exception:
+            raise Exception("face_strength must be numeric")
+        val = clamp(val, 0.5, 1.5)
+        inputs["face_strength"] = val
+        logger.info(f"✅ face_strength applied to node 198 -> {val}")
+
+    if "pose_strength" in job_input and job_input["pose_strength"] is not None:
+        try:
+            val = float(job_input["pose_strength"])
+        except Exception:
+            raise Exception("pose_strength must be numeric")
+        val = clamp(val, 0.5, 1.5)
+        inputs["pose_strength"] = val
+        logger.info(f"✅ pose_strength applied to node 198 -> {val}")
+
 
 # -------------------------
 # Handler
 # -------------------------
 def handler(job):
-    job_input = job.get("input", {})
+    job_input = job.get("input", {}) or {}
 
-    # Required params (as repo documents)
+    # Required params (keep aligned with your current infra)
+    for k in ("prompt", "seed", "width", "height", "fps", "cfg"):
+        if k not in job_input:
+            return {"error": f"Missing required field: {k}"}
+
     prompt_text = job_input["prompt"]
     seed = int(job_input["seed"])
     width = int(job_input["width"])
@@ -283,7 +359,7 @@ def handler(job):
     steps = int(job_input.get("steps", 4))
 
     # Duration cap (seconds): default 8, max 10
-    duration_sec = int(job_input.get("duration_sec", 8))
+    duration_sec = int(job_input.get("duration_sec", job_input.get("max_video_seconds", 8)))
     duration_sec = min(max(duration_sec, 1), 10)
     frame_cap = fps * duration_sec
 
@@ -291,17 +367,17 @@ def handler(job):
     temp_dir = f"/tmp/{task_id}"
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Image
+    # IMAGE input
     if "image_path" in job_input:
-        image_path = process_input(job_input["image_path"], temp_dir, "input_image.jpg", "path")
+        image_path = process_input(job_input["image_path"], temp_dir, "input_image.png", "path")
     elif "image_url" in job_input:
-        image_path = process_input(job_input["image_url"], temp_dir, "input_image.jpg", "url")
+        image_path = process_input(job_input["image_url"], temp_dir, "input_image.png", "url")
     elif "image_base64" in job_input:
-        image_path = process_input(job_input["image_base64"], temp_dir, "input_image.jpg", "base64")
+        image_path = process_input(job_input["image_base64"], temp_dir, "input_image.png", "base64")
     else:
-        raise Exception("Image input required (image_path|image_url|image_base64)")
+        return {"error": "Image input required (image_path|image_url|image_base64)"}
 
-    # Video
+    # VIDEO input
     if "video_path" in job_input:
         video_path = process_input(job_input["video_path"], temp_dir, "input_video.mp4", "path")
     elif "video_url" in job_input:
@@ -309,66 +385,118 @@ def handler(job):
     elif "video_base64" in job_input:
         video_path = process_input(job_input["video_base64"], temp_dir, "input_video.mp4", "base64")
     else:
-        raise Exception("Video input required (video_path|video_url|video_base64)")
+        return {"error": "Video input required (video_path|video_url|video_base64)"}
 
     has_points = job_input.get("points_store") is not None
     mode = job_input.get("mode", "replace")  # replace|animate
 
+    # IMPORTANT: keep the SAME workflows you already used when it worked
     if has_points:
         workflow_path = "/newWanAnimate_point_animate_api.json" if mode == "animate" else "/newWanAnimate_point_api.json"
     else:
         workflow_path = "/newWanAnimate_noSAM_animate_api.json" if mode == "animate" else "/newWanAnimate_noSAM_api.json"
 
-    prompt = load_workflow(workflow_path)
+    # Load workflow
+    try:
+        prompt = load_workflow(workflow_path)
+    except FileNotFoundError:
+        return {"error": f"Workflow not found in container: {workflow_path}"}
+    except Exception as e:
+        return {"error": f"Failed to load workflow {workflow_path}: {str(e)}"}
 
-    # Stability overrides
-    # Node 22: avoid sageattn dependency (keeps your current stability)
-    if "22" in prompt and "inputs" in prompt["22"]:
-        prompt["22"]["inputs"]["attention_mode"] = "sdpa"
+    # -------------------------
+    # Stability overrides (DO NOT TOUCH OTHER LOGIC)
+    # -------------------------
+    # SDPA fix: avoid sageattn SM90 issues
+    force_sdpa(prompt)
 
-    # Node 30: ensure output saved + unique prefix
-    if "30" in prompt and "inputs" in prompt["30"]:
-        prompt["30"]["inputs"]["save_output"] = True
-        prompt["30"]["inputs"]["filename_prefix"] = task_id
+    # Node 30: ensure output saved + unique prefix (if node exists)
+    if "30" in prompt and isinstance(prompt["30"], dict):
+        p30 = prompt["30"].setdefault("inputs", {})
+        p30["save_output"] = True
+        p30["filename_prefix"] = task_id
+        p30["frame_rate"] = fps
 
-    # Inject parameters (same ids as your handler already uses)
-    prompt["57"]["inputs"]["image"] = image_path
-    prompt["63"]["inputs"]["video"] = video_path
-    prompt["63"]["inputs"]["force_rate"] = fps
-    prompt["63"]["inputs"]["frame_load_cap"] = frame_cap  # ✅ duration limiter
-    prompt["30"]["inputs"]["frame_rate"] = fps
+    # Inject main inputs (IDs from your workflow)
+    # Node 57: LoadImage
+    if "57" in prompt and isinstance(prompt["57"], dict):
+        prompt["57"].setdefault("inputs", {})["image"] = image_path
 
-    prompt["65"]["inputs"]["positive_prompt"] = prompt_text
-    if "negative_prompt" in job_input:
-        prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
+    # Node 63: VHS_LoadVideo
+    if "63" in prompt and isinstance(prompt["63"], dict):
+        p63 = prompt["63"].setdefault("inputs", {})
+        p63["video"] = video_path
+        p63["force_rate"] = fps
+        p63["frame_load_cap"] = frame_cap  # ✅ duration limiter
 
-    prompt["27"]["inputs"]["seed"] = seed
-    prompt["27"]["inputs"]["cfg"] = cfg
-    prompt["27"]["inputs"]["steps"] = steps
+    # Node 65: WanVideoTextEncodeCached
+    if "65" in prompt and isinstance(prompt["65"], dict):
+        p65 = prompt["65"].setdefault("inputs", {})
+        p65["positive_prompt"] = prompt_text
+        if "negative_prompt" in job_input and job_input["negative_prompt"] is not None:
+            p65["negative_prompt"] = job_input["negative_prompt"]
 
-    # ✅ FIX REAL: denoise_strength injection (robust + no indent errors)
+    # Node 27: WanVideoSampler (seed/cfg/steps)
+    if "27" in prompt and isinstance(prompt["27"], dict):
+        p27 = prompt["27"].setdefault("inputs", {})
+        p27["seed"] = seed
+        p27["cfg"] = cfg
+        p27["steps"] = steps
+
+    # Resolution nodes 150/151 (INTConstant)
+    if "150" in prompt and isinstance(prompt["150"], dict):
+        prompt["150"].setdefault("inputs", {})["value"] = width
+    if "151" in prompt and isinstance(prompt["151"], dict):
+        prompt["151"].setdefault("inputs", {})["value"] = height
+
+    # Points mode nodes
+    if has_points:
+        if "107" in prompt and isinstance(prompt["107"], dict):
+            p107 = prompt["107"].setdefault("inputs", {})
+            p107["points_store"] = job_input.get("points_store")
+            p107["coordinates"] = job_input.get("coordinates")
+            p107["neg_coordinates"] = job_input.get("neg_coordinates")
+
+    # ✅ NEW: apply denoise_strength globally to sampler nodes (safe)
     apply_denoise_strength(prompt, job_input)
 
-    prompt["150"]["inputs"]["value"] = width
-    prompt["151"]["inputs"]["value"] = height
+    # ✅ NEW: face_strength + pose_strength to node 198 (safe)
+    apply_face_pose_strength(prompt, job_input)
 
-    if has_points:
-        prompt["107"]["inputs"]["points_store"] = job_input["points_store"]
-        prompt["107"]["inputs"]["coordinates"] = job_input["coordinates"]
-        prompt["107"]["inputs"]["neg_coordinates"] = job_input["neg_coordinates"]
-
-    # Run and get mp4 path
-    mp4_path = run_and_get_mp4(prompt, filename_prefix=task_id)
+    # Execute and retrieve mp4
+    try:
+        mp4_path = run_and_get_mp4(prompt, filename_prefix=task_id)
+    except Exception as e:
+        logger.exception("ComfyUI execution failed")
+        return {"error": f"ComfyUI execution failed: {str(e)}"}
 
     # Upload & return URL
     for k in ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]:
         if not os.environ.get(k):
-            raise Exception(f"Missing env var: {k}")
+            return {"error": f"Missing env var: {k}"}
 
     prefix = os.environ.get("SUPABASE_PATH_PREFIX", "wananimate").strip("/")
     dest_path = f"{prefix}/{task_id}.mp4" if prefix else f"{task_id}.mp4"
-    video_url = supabase_upload_file(mp4_path, dest_path)
 
-    return {"video_url": video_url, "duration_sec": duration_sec, "fps": fps, "frames": frame_cap}
+    try:
+        video_url = supabase_upload_file(mp4_path, dest_path)
+    except Exception as e:
+        logger.exception("Supabase upload failed")
+        return {"error": f"Supabase upload failed: {str(e)}"}
+
+    return {
+        "video_url": video_url,
+        "duration_sec": duration_sec,
+        "fps": fps,
+        "frames": frame_cap,
+        "seed": seed,
+        "cfg": cfg,
+        "steps": steps,
+        "denoise_strength": job_input.get("denoise_strength"),
+        "face_strength": job_input.get("face_strength"),
+        "pose_strength": job_input.get("pose_strength"),
+        "workflow_path": workflow_path,
+    }
+
 
 runpod.serverless.start({"handler": handler})
